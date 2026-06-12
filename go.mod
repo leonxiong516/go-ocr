@@ -1,4 +1,4 @@
-module github.com/getcharzp/go-ocr
+module github.com/leonxiong516/go-ocr
 
 go 1.24.4
 

@@ -1,6 +1,7 @@
 package ocr
 
 import (
+	ort "github.com/getcharzp/onnxruntime_purego"
 	"github.com/up-zero/gotool/imageutil"
 	"golang.org/x/image/draw"
 	"image"
@@ -22,6 +23,7 @@ type Config struct {
 	DetModelPath       string // det.onnx (检测模型) 的路径
 	RecModelPath       string // rec.onnx (识别模型) 的路径
 	DictPath           string // dict.txt (字典) 的路径
+	ThreadCount        int
 
 	// 可选参数
 	UseCuda             bool    // (可选) 是否启用 CUDA
@@ -39,7 +41,7 @@ type Engine interface {
 	RunDetect(img image.Image) ([][4]int, error)
 
 	// RunRecognize 识别图像中指定区域的文字
-	RunRecognize(img image.Image, box [4]int) (RecResult, error)
+	RunRecognize(session *ort.Session, img image.Image, box [4]int) (RecResult, error)
 
 	// RunOCR 对图像执行检测和识别
 	RunOCR(img image.Image) ([]RecResult, error)

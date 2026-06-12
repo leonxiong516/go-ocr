@@ -2,9 +2,9 @@ package ocr
 
 import (
 	"fmt"
-	"github.com/getcharzp/go-ocr/internal/onnx"
-	"github.com/getcharzp/go-ocr/internal/util"
 	ort "github.com/getcharzp/onnxruntime_purego"
+	"github.com/leonxiong516/go-ocr/internal/onnx"
+	"github.com/leonxiong516/go-ocr/internal/util"
 	"github.com/up-zero/gotool/convertutil"
 	"github.com/up-zero/gotool/imageutil"
 	"golang.org/x/image/draw"
@@ -16,9 +16,9 @@ import (
 
 // PaddleOcrEngine 是 PaddleOCR 引擎的主结构体
 type PaddleOcrEngine struct {
-	detSession *ort.Session // 检测
-	recSession *ort.Session // 识别
-	recMutex   sync.Mutex   // 保护 recSession (非并发安全)
+	detSession *ort.Session   // 检测
+	recSession []*ort.Session // 识别
+	recMutex   sync.Mutex     // 保护 recSession (非并发安全)
 
 	dict                []string // 字典
 	detMaxSideLen       int      // 检测模型最长边
@@ -67,11 +67,18 @@ func NewPaddleOcrEngine(cfg Config) (*PaddleOcrEngine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("创建 det session 失败: %w", err)
 	}
-
-	recSession, err := oc.OnnxEngine.NewSession(cfg.RecModelPath, oc.SessionOptions)
-	if err != nil {
-		detSession.Destroy()
-		return nil, fmt.Errorf("创建 rec session 失败: %w", err)
+	maxSess := cfg.ThreadCount
+	if maxSess <= 0 {
+		maxSess = 1
+	}
+	recSession := make([]*ort.Session, maxSess)
+	for i := 0; i < maxSess; i++ {
+		tmpSession, err := oc.OnnxEngine.NewSession(cfg.RecModelPath, oc.SessionOptions)
+		if err != nil {
+			detSession.Destroy()
+			return nil, fmt.Errorf("创建 rec session 失败: %w", err)
+		}
+		recSession[i] = tmpSession
 	}
 
 	engine := &PaddleOcrEngine{
@@ -137,7 +144,7 @@ func (e *PaddleOcrEngine) RunDetect(img image.Image) ([][4]int, error) {
 }
 
 // RunRecognize 识别图像中指定区域的文字
-func (e *PaddleOcrEngine) RunRecognize(img image.Image, box [4]int) (RecResult, error) {
+func (e *PaddleOcrEngine) RunRecognize(recSession *ort.Session, img image.Image, box [4]int) (RecResult, error) {
 	resultText := ""
 	resultScore := float32(0.0)
 
@@ -158,7 +165,7 @@ func (e *PaddleOcrEngine) RunRecognize(img image.Image, box [4]int) (RecResult, 
 	}
 	defer recInputTensor.Destroy()
 	recInputValues := map[string]*ort.Value{
-		e.recSession.InputNames[0]: recInputTensor,
+		recSession.InputNames[0]: recInputTensor,
 	}
 
 	// 准备动态识别输出
@@ -170,10 +177,8 @@ func (e *PaddleOcrEngine) RunRecognize(img image.Image, box [4]int) (RecResult, 
 	}
 
 	// 模型推理
-	e.recMutex.Lock()
-	recOutputValues, runErr := e.recSession.Run(recInputValues)
-	e.recMutex.Unlock()
-	recOutputValue := recOutputValues[e.recSession.OutputNames[0]]
+	recOutputValues, runErr := recSession.Run(recInputValues)
+	recOutputValue := recOutputValues[recSession.OutputNames[0]]
 	defer recOutputValue.Destroy()
 
 	recOutputData, err := ort.GetTensorData[float32](recOutputValue)
@@ -216,19 +221,40 @@ func (e *PaddleOcrEngine) RunOCR(img image.Image) ([]RecResult, error) {
 		errs = append(errs, err)
 		e.recMutex.Unlock()
 	}
-
-	for i, box := range finalBoxes {
-		// 为每个 box 启动一个 goroutine
-		go func(i int, box [4]int) {
-			defer wg.Done()
-			result, err := e.RunRecognize(img, box)
-			if err != nil {
-				handlerError(fmt.Errorf("识别框 (box: %v) 错误: %w", box, err))
+	boxCount := len(finalBoxes)
+	for k, v := range e.recSession {
+		go func(index int, session *ort.Session) {
+			pos := index
+			if boxCount < index+1 {
 				return
 			}
-			results[i] = result
-		}(i, box)
+			for pos < boxCount {
+				result, err := e.RunRecognize(session, img, finalBoxes[pos])
+				if err != nil {
+					handlerError(fmt.Errorf("识别框 (box: %v) 错误: %w", finalBoxes[pos], err))
+					wg.Done()
+					continue
+				}
+				results[pos] = result
+				wg.Done()
+				pos += len(e.recSession)
+			}
+		}(k, v)
 	}
+	/*
+		for i, box := range finalBoxes {
+			// 为每个 box 启动一个 goroutine
+			go func(i int, box [4]int) {
+				defer wg.Done()
+				result, err := e.RunRecognize(e.recSession[0], img, box)
+				if err != nil {
+					handlerError(fmt.Errorf("识别框 (box: %v) 错误: %w", box, err))
+					return
+				}
+				results[i] = result
+			}(i, box)
+		}
+	*/
 
 	wg.Wait()
 
@@ -245,7 +271,9 @@ func (e *PaddleOcrEngine) Destroy() {
 		e.detSession.Destroy()
 	}
 	if e.recSession != nil {
-		e.recSession.Destroy()
+		for _, v := range e.recSession {
+			v.Destroy()
+		}
 	}
 }
 
